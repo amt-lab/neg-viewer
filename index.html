@@ -17,6 +17,8 @@
   #panel.hidden { display: none; }
   button, select { background: #333; color: #eee; border: 1px solid #555; border-radius: 6px; padding: 6px 10px; font: inherit; }
   button.on { background: #2a6; border-color: #3b7; }
+  #lock { background: #4a3a14; border-color: #a8842a; color: #fd9; }  /* amber, to stand out from the other toggles */
+  #lock.on { background: #e0a020; border-color: #fc5; color: #000; font-weight: 600; }
   label { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
   input[type=range] { width: 90px; }
   #cam { max-width: 180px; }
@@ -24,6 +26,25 @@
   #menu { position: fixed; top: calc(8px + env(safe-area-inset-top)); right: 8px; }
   #msg { position: fixed; top: calc(8px + env(safe-area-inset-top)); left: 8px; right: 60px; font-size: 13px; color: #8f8; text-shadow: 0 0 3px #000; pointer-events: none; }
   #start { position: fixed; inset: 0; margin: auto; width: 200px; height: 60px; font-size: 18px; display: none; }
+
+  /* Phone held sideways: controls in a two-column strip on the right, image in the space to its left. */
+  @media (orientation: landscape) and (max-height: 500px) {
+    #panel {
+      --w: 220px;
+      left: auto; top: calc(8px + env(safe-area-inset-top)); right: calc(8px + env(safe-area-inset-right));
+      width: var(--w); box-sizing: border-box; overflow-y: auto;
+      display: grid; grid-template-columns: 1fr 1fr; align-content: start; gap: 5px;
+    }
+    #panel.hidden { display: none; }
+    #panel > select, #panel > span, #panel > label { grid-column: 1 / -1; }
+    #panel > button { padding: 6px 4px; }
+    #cam { max-width: none; margin-right: 44px; }  /* leaves the corner free for the menu button */
+    #resolution { white-space: normal; font-size: 12px; text-align: center; }
+    #panel input[type=range] { flex: 1; min-width: 0; width: auto; }
+    #menu { z-index: 1; top: calc(16px + env(safe-area-inset-top)); right: calc(16px + env(safe-area-inset-right)); }
+    body:has(#panel:not(.hidden)) #stage { right: calc(236px + env(safe-area-inset-right)); }
+    #msg { right: calc(244px + env(safe-area-inset-right)); }
+  }
 </style>
 </head>
 <body>

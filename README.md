@@ -2,6 +2,8 @@
 
 A quick, good-enough live viewer for film negatives. Put the film on a light source, point a camera at it, and see the positive on screen. It is for inspecting negatives before scanning, not for scanning them.
 
+It runs in a browser and uses any camera the browser can see: a phone's own camera, a webcam, or a proper camera connected to a computer through a UVC HDMI capture card.
+
 Live: https://amt-lab.github.io/neg-viewer/
 
 ## Serving
@@ -31,4 +33,6 @@ The green dashed box is the metering area: the automatic levels are measured ins
 | Full screen | F | |
 | ☰ | P | Show or hide the controls |
 
-`desktop/` holds a separate Python app for a Mac with an HDMI capture dongle; see its own README.
+## Desktop alternative
+
+`desktop/` is a separate Python app that does the same job without a browser, for a Mac with a camera on a UVC HDMI capture card. It is optional and not yet tested with a capture card. See [`desktop/README.md`](desktop/README.md).

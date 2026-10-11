@@ -2,7 +2,7 @@
 
 Python / PyQt6 version of the viewer, for a Mac with a USB HDMI capture dongle: camera or capture card → `process_image()` (NumPy) → window. The browser version is `../index.html`.
 
-Tested with `--demo` only, not yet with a real camera or capture dongle.
+Tested in demo mode and with the Mac's built-in camera, not yet with a capture dongle.
 
 ## Setup
 
