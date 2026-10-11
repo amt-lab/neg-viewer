@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000">
+<title>Neg Viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 14px -apple-system, system-ui, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; touch-action: none; }
+  #view { max-width: 100%; max-height: 100%; display: block; }
+  #video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; } /* not display:none: iOS stops decoding hidden video */
+  #roi { position: fixed; border: 1px dashed #0f0; pointer-events: none; display: none; }
+  #panel { position: fixed; left: 8px; right: 8px; bottom: calc(8px + env(safe-area-inset-bottom)); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: rgba(20,20,20,.85); padding: 8px; border-radius: 10px; }
+  #panel.hidden { display: none; }
+  button, select { background: #333; color: #eee; border: 1px solid #555; border-radius: 6px; padding: 6px 10px; font: inherit; }
+  button.on { background: #2a6; border-color: #3b7; }
+  label { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+  input[type=range] { width: 90px; }
+  #cam { max-width: 180px; }
+  #resolution { color: #aaa; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #menu { position: fixed; top: calc(8px + env(safe-area-inset-top)); right: 8px; }
+  #msg { position: fixed; top: calc(8px + env(safe-area-inset-top)); left: 8px; right: 60px; font-size: 13px; color: #8f8; text-shadow: 0 0 3px #000; pointer-events: none; }
+  #start { position: fixed; inset: 0; margin: auto; width: 200px; height: 60px; font-size: 18px; display: none; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted autoplay></video>
+<div id="stage"><canvas id="view"></canvas></div>
+<div id="roi"></div>
+<div id="msg"></div>
+<button id="menu" title="Show/hide controls (P)">☰</button>
+<button id="start">Start camera</button>
+
+<div id="panel">
+  <select id="cam" title="Camera"></select>
+  <span id="resolution" title="Actual camera-feed and saved PNG dimensions" aria-live="polite">Feed — · Save —</span>
+  <button id="invert" class="on" title="I">Invert</button>
+  <button id="mono" title="M">B&amp;W</button>
+  <button id="lock" title="Freeze the levels (L)">Lock levels</button>
+  <button id="freeze" title="Space">Freeze</button>
+  <button id="orig" title="Hold to see the raw feed (O)">Orig</button>
+  <button id="rot" title="R">Rotate</button>
+  <button id="flipH" title="H">Flip H</button>
+  <button id="flipV" title="V">Flip V</button>
+  <label title="Percent of pixels clipped at each end, per channel">Clip <input id="clip" type="range" min="0" max="5" step="0.1" value="0.5"><span id="clipV">0.5%</span></label>
+  <label>Gamma <input id="gamma" type="range" min="0.4" max="2.5" step="0.05" value="1"><span id="gammaV">1.00</span></label>
+  <button id="save" title="S">Save</button>
+  <button id="fs" title="F">Full screen</button>
+</div>
+
+<script>
+// Fraction of the frame (width and height) covered by the visible metering box at startup.
+// After startup, metering follows the visible box exactly; clearing it means the true full frame.
+const INITIAL_METERING_FRACTION = 0.75;
+
+function centeredRoi(fraction) {
+  const margin = (1 - fraction) / 2;
+  return { x0: margin, y0: margin, x1: 1 - margin, y1: 1 - margin };
+}
+
+const $ = id => document.getElementById(id);
+const video = $('video'), view = $('view'), roiBox = $('roi'), resolution = $('resolution');
+
+const state = {
+  invert: true, mono: false, lock: false, freeze: false, orig: false,
+  flipH: false, flipV: false, rot: 0,  // rot = quarter turns clockwise
+  clip: 0.5, gamma: 1,
+  roi: centeredRoi(INITIAL_METERING_FRACTION), // visible startup box; null = true whole frame
+};
+const lo = [0, 0, 0], hi = [1, 1, 1];
+let haveStats = false, stream = null;
+
+let msgTimer;
+function flash(text, ms = 2500) {
+  $('msg').textContent = text;
+  clearTimeout(msgTimer);
+  if (ms) msgTimer = setTimeout(() => $('msg').textContent = '', ms);
+}
+
+// Display uv -> source (video) uv. Must match toSrc() in the fragment shader.
+function toSrc(u, v) {
+  if (state.flipH) u = 1 - u;
+  if (state.flipV) v = 1 - v;
+  switch (state.rot) {
+    case 1: return [v, 1 - u];
+    case 2: return [1 - u, 1 - v];
+    case 3: return [1 - v, u];
+    default: return [u, v];
+  }
+}
+
+// ---------- WebGL ----------
+const gl = view.getContext('webgl', { preserveDrawingBuffer: true, antialias: false });
+if (!gl) flash('WebGL not available', 0);
+
+function shader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, shader(gl.VERTEX_SHADER, `
+  attribute vec2 p;
+  varying vec2 uv;
+  void main() { uv = vec2(p.x * .5 + .5, .5 - p.y * .5); gl_Position = vec4(p, 0., 1.); }
+`));
+gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, `
+  precision mediump float;
+  varying vec2 uv;
+  uniform sampler2D tex;
+  uniform vec3 lo, hi;
+  uniform float gamma, invert, mono, orig, flipH, flipV, rot;
+  vec2 toSrc(vec2 d) {
+    if (flipH > .5) d.x = 1. - d.x;
+    if (flipV > .5) d.y = 1. - d.y;
+    if (rot > 2.5) return vec2(1. - d.y, d.x);
+    if (rot > 1.5) return 1. - d;
+    if (rot > .5)  return vec2(d.y, 1. - d.x);
+    return d;
+  }
+  void main() {
+    vec3 c = texture2D(tex, toSrc(uv)).rgb;
+    if (orig < .5) {
+      c = clamp((c - lo) / max(hi - lo, vec3(1e-3)), 0., 1.);
+      if (invert > .5) c = 1. - c;
+      c = pow(c, vec3(1. / gamma));
+      if (mono > .5) c = vec3(dot(c, vec3(.2126, .7152, .0722)));
+    }
+    gl_FragColor = vec4(c, 1.);
+  }
+`));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+const pLoc = gl.getAttribLocation(prog, 'p');
+gl.enableVertexAttribArray(pLoc);
+gl.vertexAttribPointer(pLoc, 2, gl.FLOAT, false, 0, 0);
+
+gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+const U = {};
+for (const n of ['lo', 'hi', 'gamma', 'invert', 'mono', 'orig', 'flipH', 'flipV', 'rot']) U[n] = gl.getUniformLocation(prog, n);
+
+let shownResolution = '';
+function updateResolution(feedW, feedH, saveW, saveH) {
+  const text = `Feed ${feedW}×${feedH} · Save ${saveW}×${saveH}`;
+  if (text !== shownResolution) {
+    resolution.textContent = text;
+    shownResolution = text;
+  }
+}
+
+function render() {
+  requestAnimationFrame(render);
+  if (video.readyState < 2 || !video.videoWidth) return;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const [w, h] = state.rot % 2 ? [vh, vw] : [vw, vh];
+  if (view.width !== w || view.height !== h) { view.width = w; view.height = h; }
+  updateResolution(vw, vh, w, h);
+  gl.viewport(0, 0, w, h);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+  gl.uniform3fv(U.lo, lo);
+  gl.uniform3fv(U.hi, hi);
+  gl.uniform1f(U.gamma, state.gamma);
+  gl.uniform1f(U.invert, +state.invert);
+  gl.uniform1f(U.mono, +state.mono);
+  gl.uniform1f(U.orig, +state.orig);
+  gl.uniform1f(U.flipH, +state.flipH);
+  gl.uniform1f(U.flipV, +state.flipV);
+  gl.uniform1f(U.rot, state.rot);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  drawRoiBox();
+}
+requestAnimationFrame(render);
+
+// ---------- Levels: per-channel percentile black/white points on a small copy, ~10x/sec ----------
+const sc = document.createElement('canvas');
+const sctx = sc.getContext('2d', { willReadFrequently: true });
+const hist = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
+
+function updateStats() {
+  if (state.lock || video.readyState < 2 || !video.videoWidth) return;
+  const W = 160, H = Math.max(1, Math.round(W * video.videoHeight / video.videoWidth));
+  if (sc.width !== W || sc.height !== H) { sc.width = W; sc.height = H; }
+  sctx.drawImage(video, 0, 0, W, H);
+
+  let x0 = 0, y0 = 0, x1 = 1, y1 = 1;
+  if (state.roi) {
+    const a = toSrc(state.roi.x0, state.roi.y0), b = toSrc(state.roi.x1, state.roi.y1);
+    x0 = Math.min(a[0], b[0]); x1 = Math.max(a[0], b[0]);
+    y0 = Math.min(a[1], b[1]); y1 = Math.max(a[1], b[1]);
+  }
+  const px0 = Math.floor(x0 * W), py0 = Math.floor(y0 * H);
+  const pw = Math.max(1, Math.ceil(x1 * W) - px0), ph = Math.max(1, Math.ceil(y1 * H) - py0);
+  const d = sctx.getImageData(px0, py0, pw, ph).data;
+
+  hist.forEach(h => h.fill(0));
+  for (let i = 0; i < d.length; i += 4) { hist[0][d[i]]++; hist[1][d[i + 1]]++; hist[2][d[i + 2]]++; }
+  const cut = (d.length / 4) * state.clip / 100;
+  const k = haveStats ? 0.35 : 1;  // light smoothing so levels don't flicker
+  for (let c = 0; c < 3; c++) {
+    let acc = 0, l = 0, h = 255;
+    for (let v = 0; v < 256; v++) { acc += hist[c][v]; if (acc > cut) { l = v; break; } }
+    acc = 0;
+    for (let v = 255; v >= 0; v--) { acc += hist[c][v]; if (acc > cut) { h = v; break; } }
+    if (h - l < 4) h = Math.min(255, l + 4);
+    lo[c] += k * (l / 255 - lo[c]);
+    hi[c] += k * (h / 255 - hi[c]);
+  }
+  haveStats = true;
+}
+setInterval(updateStats, 100);
+
+// ---------- ROI: drag on the image to meter levels from that area; tap to clear ----------
+let drag = null;
+function normPos(e) {
+  const r = view.getBoundingClientRect();
+  return [Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+          Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))];
+}
+$('stage').addEventListener('pointerdown', e => {
+  drag = normPos(e);
+  $('stage').setPointerCapture(e.pointerId);
+});
+$('stage').addEventListener('pointermove', e => {
+  if (!drag) return;
+  const [x, y] = normPos(e);
+  if (Math.abs(x - drag[0]) > 0.02 || Math.abs(y - drag[1]) > 0.02)
+    state.roi = { x0: Math.min(x, drag[0]), y0: Math.min(y, drag[1]), x1: Math.max(x, drag[0]), y1: Math.max(y, drag[1]) };
+});
+$('stage').addEventListener('pointerup', e => {
+  if (!drag) return;
+  const [x, y] = normPos(e);
+  if (Math.abs(x - drag[0]) <= 0.02 && Math.abs(y - drag[1]) <= 0.02) { state.roi = null; flash('Metering: full frame'); }
+  else flash('Metering: selected area');
+  drag = null;
+});
+
+function drawRoiBox() {
+  if (!state.roi) { roiBox.style.display = 'none'; return; }
+  const r = view.getBoundingClientRect(), q = state.roi;
+  Object.assign(roiBox.style, {
+    display: 'block',
+    left: r.left + q.x0 * r.width + 'px', top: r.top + q.y0 * r.height + 'px',
+    width: (q.x1 - q.x0) * r.width + 'px', height: (q.y1 - q.y0) * r.height + 'px',
+  });
+}
+
+// ---------- Camera ----------
+async function start(deviceId) {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    flash('Camera API unavailable. Open via https:// or http://localhost', 0);
+    return;
+  }
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  const size = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: deviceId ? { deviceId: { exact: deviceId }, ...size } : { facingMode: { ideal: 'environment' }, ...size },
+    });
+  } catch (e) {
+    if (deviceId) return start();  // remembered camera is gone; fall back to default
+    $('start').style.display = 'block';
+    flash('Camera error: ' + e.message, 0);
+    return;
+  }
+  $('start').style.display = 'none';
+  flash('');
+  video.srcObject = stream;
+  await video.play().catch(() => {});
+  haveStats = false;
+
+  const current = stream.getVideoTracks()[0].getSettings().deviceId;
+  try { localStorage.setItem('neg.cam', current); } catch {}
+  const cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  $('cam').innerHTML = '';
+  cams.forEach((d, i) => $('cam').add(new Option(d.label || `Camera ${i + 1}`, d.deviceId)));
+  $('cam').value = current;
+}
+$('cam').onchange = () => start($('cam').value);
+$('start').onclick = () => start();
+
+let savedCam = null;
+try { savedCam = localStorage.getItem('neg.cam'); } catch {}
+start(savedCam);
+
+// ---------- Controls ----------
+function setToggle(key, value = !state[key]) {
+  state[key] = value;
+  $(key).classList.toggle('on', value);
+  if (key === 'freeze') value ? video.pause() : video.play();
+}
+for (const key of ['invert', 'mono', 'lock', 'freeze', 'flipH', 'flipV']) $(key).onclick = () => setToggle(key);
+
+const rotate = () => { state.rot = (state.rot + 1) % 4; };
+$('rot').onclick = rotate;
+
+const orig = $('orig');
+orig.onpointerdown = () => setToggle('orig', true);
+orig.onpointerup = orig.onpointerleave = orig.onpointercancel = () => setToggle('orig', false);
+
+$('clip').oninput = e => { state.clip = +e.target.value; $('clipV').textContent = state.clip.toFixed(1) + '%'; };
+$('gamma').oninput = e => { state.gamma = +e.target.value; $('gammaV').textContent = state.gamma.toFixed(2); };
+
+function save() {
+  view.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = `neg-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  });
+}
+$('save').onclick = save;
+
+function fullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen?.().catch(() => flash('Full screen not supported here'));
+}
+$('fs').onclick = fullscreen;
+
+const togglePanel = () => $('panel').classList.toggle('hidden');
+$('menu').onclick = togglePanel;
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT' || e.metaKey || e.ctrlKey) return;
+  const actions = {
+    ' ': () => setToggle('freeze'), i: () => setToggle('invert'), m: () => setToggle('mono'),
+    l: () => setToggle('lock'), h: () => setToggle('flipH'), v: () => setToggle('flipV'),
+    r: rotate, s: save, f: fullscreen, p: togglePanel,
+    o: () => setToggle('orig', true), Escape: () => { state.roi = null; flash('Metering: full frame'); },
+  };
+  const fn = actions[e.key.length === 1 ? e.key.toLowerCase() : e.key];
+  if (fn && !e.repeat) { e.preventDefault(); fn(); }
+});
+// Don't leave buttons focused, or Space would re-click the last one instead of toggling Freeze.
+document.addEventListener('click', e => { if (e.target.tagName === 'BUTTON') e.target.blur(); });
+document.addEventListener('keyup', e => { if (e.key.toLowerCase() === 'o') setToggle('orig', false); });
+</script>
+</body>
+</html>
